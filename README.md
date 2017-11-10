@@ -56,12 +56,12 @@ func main() {
 	<-server.Done()
 }
 
-func consumer(in <-chan string) {
-	// receive capitalized strings from in
-}
-
 func producer(out chan<- string) {
 	// send strings to be capitalized to out
+}
+
+func consumer(in <-chan string) {
+	// receive capitalized strings from in
 }
 ```
 
@@ -74,6 +74,7 @@ package main
 import (
 	"log"
 	"net"
+	"strings"
 
 	"github.com/dradtke/distchan"
 )
