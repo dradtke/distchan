@@ -1,25 +1,23 @@
 package distchan_test
 
 import (
-	"fmt"
+	"net"
 	"reflect"
 	"testing"
 
 	"github.com/dradtke/distchan"
 )
 
-func Test(t *testing.T) {
-	var (
-		s   *distchan.Server
-		err error
-	)
+func TestDistchan(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sch := make(chan string)
+	server := distchan.ChanServer(ln, sch, nil)
 
 	go func() {
-		sch := make(chan string)
-		if s, err = distchan.ChanServer("localhost:5678", sch); err != nil {
-			t.Fatal(err)
-		}
-		s.WaitUntilReady()
 		sch <- "why"
 		sch <- "hello"
 		sch <- "there"
@@ -27,14 +25,16 @@ func Test(t *testing.T) {
 		close(sch)
 	}()
 
-	cch := make(chan string)
-	if err := distchan.Chan("localhost:5678", cch); err != nil {
+	conn, err := net.Dial(ln.Addr().Network(), ln.Addr().String())
+	if err != nil {
 		t.Fatal(err)
 	}
 
+	inCh := make(chan string)
+	distchan.ChanRead(conn, inCh)
+
 	var received []string
-	for msg := range cch {
-		fmt.Printf("[client] received %v!\n", msg)
+	for msg := range inCh {
 		received = append(received, msg)
 	}
 
@@ -42,5 +42,5 @@ func Test(t *testing.T) {
 		t.Errorf("received unexpected values: %v", received)
 	}
 
-	<-s.Done()
+	<-server.Done()
 }

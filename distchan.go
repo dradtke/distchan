@@ -2,8 +2,6 @@ package distchan
 
 import (
 	"encoding/gob"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -12,12 +10,10 @@ import (
 	"time"
 )
 
-var (
-	BindAddr = flag.String("bind", "", "bind address")
-)
-
+// Server represents a registration between a network listener and a pair
+// of channels, one for input and one for output.
 type Server struct {
-	chv          reflect.Value
+	inv, outv    reflect.Value
 	ln           net.Listener
 	mu           sync.Mutex
 	connections  []connection
@@ -25,16 +21,20 @@ type Server struct {
 	closed, done chan struct{}
 }
 
+// Done returns a read-only channel that will be closed when the server
+// has been fully shut down.
 func (s *Server) Done() <-chan struct{} {
 	return s.done
 }
 
+// Ready returns true if there are any clients currently connected.
 func (s *Server) Ready() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.connections) > 0
 }
 
+// WaitUntilReady blocks until the server has at least one client available.
 func (s *Server) WaitUntilReady() {
 	for {
 		time.Sleep(1 * time.Second)
@@ -71,44 +71,65 @@ func (s *Server) handleIncomingConnections() {
 			return
 
 		case conn := <-newConns:
-			enc, dec := gob.NewEncoder(conn), gob.NewDecoder(conn)
-			s.mu.Lock()
-			s.connections = append(s.connections, connection{
+			c := connection{
 				conn: conn,
-				enc:  enc,
-				dec:  dec,
-			})
+				enc:  gob.NewEncoder(conn),
+				dec:  gob.NewDecoder(conn),
+			}
+			s.mu.Lock()
+			s.connections = append(s.connections, c)
+			if s.inv != (reflect.Value{}) {
+				go s.handleIncomingMessages(c)
+			}
 			s.mu.Unlock()
 		}
 	}
 }
 
-func (s *Server) handleChannelReceives() {
+func (s *Server) handleIncomingMessages(c connection) {
+	et := s.inv.Type().Elem()
 	for {
-		x, ok := s.chv.Recv()
+		x := reflect.New(et)
+		if err := c.dec.DecodeValue(x); err != nil {
+			if err == io.EOF {
+				return
+			}
+			fmt.Printf("[server] error decoding value: %s\n", err)
+		}
+		s.inv.Send(x.Elem())
+	}
+}
+
+func (s *Server) increment() {
+	s.i += 1
+	if s.i >= len(s.connections) {
+		s.i = 0
+	}
+}
+
+func (s *Server) handleOutgoingMessages() {
+	s.WaitUntilReady()
+	for {
+		x, ok := s.outv.Recv()
 		if !ok {
-			fmt.Println("[server] detected channel close, cleaning up")
 			break
 		}
 
 		s.mu.Lock()
-		// fmt.Printf("  sending to channel %d\n", s.i)
-		// TODO: what to do if no clients exist yet? Probs put it right back on the channel.
-		if len(s.connections) == 0 {
-			fmt.Println("[server] re-sending")
-			s.chv.Send(x)
-			time.Sleep(2 * time.Second)
-		} else {
-			fmt.Printf("[server] sending %v\n", x.Interface())
-			for err := s.connections[s.i].enc.EncodeValue(x); err != nil; err = s.connections[s.i].enc.EncodeValue(x) {
-				fmt.Printf("[server] error encoding value: %s\n", err)
-				time.Sleep(1 * time.Second)
-			}
-			s.i += 1
-			if s.i >= len(s.connections) {
-				s.i = 0
+		for {
+			if err := s.connections[s.i].enc.EncodeValue(x); err != nil {
+				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
+				if len(s.connections) == 0 {
+					s.mu.Unlock()
+					s.WaitUntilReady()
+					s.mu.Lock()
+				}
+				s.increment()
+			} else {
+				break
 			}
 		}
+		s.increment()
 		s.mu.Unlock()
 	}
 
@@ -122,71 +143,36 @@ func (s *Server) handleChannelReceives() {
 	}
 }
 
-func ChanServer(bindAddr string, ch interface{}) (*Server, error) {
-	if bindAddr == "" {
-		return nil, errors.New("no bind address")
-	}
-
-	chv := reflect.ValueOf(ch)
-	if chv.Kind() != reflect.Chan {
-		return nil, errors.New("not a channel")
-	}
-
-	ln, err := net.Listen("tcp", bindAddr)
-	if err != nil {
-		return nil, err
-	}
-
+// ChanServer registers a pair of channels with an active listener. Gob-encoded
+// messages received on the listener will be passed to in; any values passed to
+// out will be gob-encoded and written to one open connection. The server uses
+// a simple round-robin strategy when deciding which connection to send the message
+// to; no client is favored over any others.
+func ChanServer(ln net.Listener, out, in interface{}) *Server {
 	s := &Server{
-		chv:    chv,
+		outv:   reflect.ValueOf(out),
+		inv:    reflect.ValueOf(in),
 		ln:     ln,
 		closed: make(chan struct{}),
 		done:   make(chan struct{}),
 	}
 
 	go s.handleIncomingConnections()
-	go s.handleChannelReceives()
-
-	return s, nil
+	if out != nil {
+		go s.handleOutgoingMessages()
+	}
+	return s
 }
 
-func Chan(dialAddr string, ch interface{}) error {
-	if dialAddr == "" {
-		return errors.New("no dial address")
-	}
-
-	chv := reflect.ValueOf(ch)
-	if chv.Kind() != reflect.Chan {
-		return errors.New("not a channel")
-	}
-	et := chv.Type().Elem()
-
-	conn, err := net.Dial("tcp", dialAddr)
-	if err != nil {
-		return err
-	}
-	go clientHandleConn(conn, chv, et)
-	return nil
-}
-
-func clientHandleConn(conn net.Conn, chv reflect.Value, et reflect.Type) {
-	var (
-		enc = gob.NewEncoder(conn)
-		dec = gob.NewDecoder(conn)
-	)
+// ChanRead pipes incoming gob-encoded messages from conn to the channel ch.
+func ChanRead(conn net.Conn, ch interface{}) {
 	go func() {
-		for {
-			x, ok := chv.Recv()
-			if !ok {
-				break
-			}
-			if err := enc.EncodeValue(x); err != nil {
-				fmt.Printf("[client] error encoding value: %s\n", err)
-			}
-		}
-	}()
+		var (
+			chv = reflect.ValueOf(ch)
+			et  = chv.Type().Elem()
+			dec = gob.NewDecoder(conn)
+		)
 
-	go func() {
 		defer func() {
 			chv.Close()
 
@@ -199,19 +185,33 @@ func clientHandleConn(conn net.Conn, chv reflect.Value, et reflect.Type) {
 
 		for {
 			x := reflect.New(et)
-			for {
-				if err := dec.DecodeValue(x); err != nil {
-					if err == io.EOF {
-						fmt.Println("[client] found EOF")
-						return
-					}
-					fmt.Printf("[client] error decoding value: %s\n", err)
-				} else {
-					break
+			if err := dec.DecodeValue(x); err != nil {
+				if err == io.EOF {
+					return
 				}
+			} else {
+				chv.Send(x.Elem())
 			}
-			fmt.Printf("[client] decoded %v\n", x.Elem().Interface())
-			chv.Send(x.Elem())
+		}
+	}()
+}
+
+// ChanWrite writes values from the channel ch as gob-encoded messages to conn.
+func ChanWrite(conn net.Conn, ch interface{}) {
+	go func() {
+		var (
+			chv = reflect.ValueOf(ch)
+			enc = gob.NewEncoder(conn)
+		)
+
+		for {
+			x, ok := chv.Recv()
+			if !ok {
+				return
+			}
+			if err := enc.EncodeValue(x); err != nil {
+				fmt.Printf("[client] error encoding value %v: %s\n", x.Interface(), err)
+			}
 		}
 	}()
 }
