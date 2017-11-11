@@ -11,11 +11,12 @@ import (
 )
 
 type AdderInput struct {
+	ID   string
 	A, B int
 }
 
 type AdderOutput struct {
-	Input  AdderInput
+	ID     string
 	Answer int
 }
 
@@ -39,14 +40,14 @@ func main() {
 		panic(err)
 	}
 
-	distchan.ChanRead(conn, in)
-	distchan.ChanWrite(conn, out)
+	distchan.NewClient(conn, out, in).Start()
 
+	fmt.Println("waiting for input...")
 	for input := range in {
-		fmt.Printf("processing %d + %d...\n", input.A, input.B)
+		fmt.Printf("[%s] processing %d + %d\n", input.ID, input.A, input.B)
 		answer := input.A + input.B
 		out <- AdderOutput{
-			Input:  input,
+			ID:     input.ID,
 			Answer: answer,
 		}
 	}

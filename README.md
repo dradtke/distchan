@@ -37,7 +37,7 @@ import (
 )
 
 func main() {
-	ln, err := net.Listen("tcp", "...")
+	ln, err := net.Listen("tcp", "localhost:5678")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -45,23 +45,25 @@ func main() {
 	var (
 		out    = make(chan string)
 		in     = make(chan string)
-		server = distchan.ChanServer(ln, out, in)
+		server = distchan.NewServer(ln, out, in)
 	)
 
+	server.Start()
 	server.WaitUntilReady() // wait until we have at least one worker available
 
-	go consumer(in)
 	go producer(out)
 
-	<-server.Done()
+	for s := range in {
+		println(s)
+	}
 }
 
 func producer(out chan<- string) {
 	// send strings to be capitalized to out
-}
-
-func consumer(in <-chan string) {
-	// receive capitalized strings from in
+	out <- "hello world"
+	// don't forget to close the channel! this is how all connected
+	// clients know that there's no more work coming.
+	close(out)
 }
 ```
 
@@ -80,18 +82,17 @@ import (
 )
 
 func main() {
-	conn, err := net.Dial("tcp", "...") // must be able to connect to the server
+	conn, err := net.Dial("tcp", "localhost:5678") // must be able to connect to the server
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	var (
-		out    = make(chan string)
-		in     = make(chan string)
+		out = make(chan string)
+		in  = make(chan string)
 	)
 
-	distchan.ChanWrite(conn, out)
-	distchan.ChanRead(conn, in)
+	client := distchan.NewClient(conn, out, in).Start()
 
 	// Loop over all input from the server...
 	for input := range in {
@@ -99,8 +100,10 @@ func main() {
 		// ...and send the results back.
 		out <- capitalized
 	}
+
+	close(out)
+	<-client.Done()
 }
 ```
 
-A (slightly) more complete example can be found in the `example` folder,
-including the usage of custom types.
+Check out the `example` folder for more examples.

@@ -1,36 +1,88 @@
 package distchan
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/gob"
-	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
 	"reflect"
 	"sync"
 	"time"
 )
 
+// NewServer registers a pair of channels with an active listener. Gob-encoded
+// messages received on the listener will be passed to in; any values passed to
+// out will be gob-encoded and written to one open connection. The server uses
+// a simple round-robin strategy when deciding which connection to send the message
+// to; no client is favored over any others.
+//
+// Note that the returned value's Start() method must be called before any
+// messages will be passed. This gives the user an opportunity to register
+// encoders and decoders before any data passes over the network.
+func NewServer(ln net.Listener, out, in interface{}) *Server {
+	return &Server{
+		ln:     ln,
+		outv:   reflect.ValueOf(out),
+		inv:    reflect.ValueOf(in),
+		closed: make(chan struct{}),
+		done:   make(chan struct{}),
+		logger: log.New(os.Stdout, "[distchan] ", log.Lshortfile),
+	}
+}
+
 // Server represents a registration between a network listener and a pair
 // of channels, one for input and one for output.
 type Server struct {
-	inv, outv    reflect.Value
-	ln           net.Listener
-	mu           sync.Mutex
-	connections  []connection
-	i            int
-	closed, done chan struct{}
+	ln                 net.Listener
+	inv, outv          reflect.Value
+	mu                 sync.RWMutex
+	connections        []*clientConn
+	encoders, decoders []Transformer
+	i                  int
+	closed, done       chan struct{}
+	logger             *log.Logger
 }
 
-// Done returns a read-only channel that will be closed when the server
-// has been fully shut down.
-func (s *Server) Done() <-chan struct{} {
-	return s.done
+type clientConn struct {
+	c   net.Conn
+	buf *bytes.Buffer
+	enc *gob.Encoder
+}
+
+// Start instructs the server to begin serving messages.
+func (s *Server) Start() *Server {
+	go s.handleIncomingConnections()
+	if s.outv != (reflect.Value{}) {
+		go s.handleOutgoingMessages()
+	}
+	return s
+}
+
+// AddEncoder adds a new encoder to the server. Any outbound messages
+// will be passed through all registered encoders before being sent
+// over the wire. See the tests for an example of encoding the data
+// using AES encryption.
+func (s *Server) AddEncoder(f Transformer) *Server {
+	s.encoders = append(s.encoders, f)
+	return s
+}
+
+// AddDecoder adds a new decoder to the server. Any inbound messages
+// will be passed through all registered decoders before being sent
+// to the channel. See the tests for an example of decoding the data
+// using AES encryption.
+func (s *Server) AddDecoder(f Transformer) *Server {
+	s.decoders = append(s.decoders, f)
+	return s
 }
 
 // Ready returns true if there are any clients currently connected.
 func (s *Server) Ready() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.connections) > 0
 }
 
@@ -39,15 +91,17 @@ func (s *Server) WaitUntilReady() {
 	for {
 		time.Sleep(1 * time.Second)
 		if s.Ready() {
+			s.i = 0
 			return
 		}
 	}
 }
 
-type connection struct {
-	conn net.Conn
-	enc  *gob.Encoder
-	dec  *gob.Decoder
+// Logger exposes the server's internal logger so that it can be configured.
+// For example, if you want the logs to go somewhere besides standard output
+// (the default), you can use s.Logger().SetOutput(...).
+func (s *Server) Logger() *log.Logger {
+	return s.logger
 }
 
 func (s *Server) handleIncomingConnections() {
@@ -67,37 +121,83 @@ func (s *Server) handleIncomingConnections() {
 	for {
 		select {
 		case <-s.closed:
-			close(s.done)
-			return
-
-		case conn := <-newConns:
-			c := connection{
-				conn: conn,
-				enc:  gob.NewEncoder(conn),
-				dec:  gob.NewDecoder(conn),
+			s.mu.RLock()
+			for _, conn := range s.connections {
+				if err := binary.Write(conn.c, binary.LittleEndian, int32(-1)); err != nil {
+					s.logger.Println(err)
+				}
 			}
+			s.mu.RUnlock()
+
+			for {
+				s.mu.RLock()
+				if len(s.connections) == 0 {
+					s.inv.Close()
+					return
+				}
+				s.mu.RUnlock()
+				time.Sleep(500 * time.Millisecond)
+			}
+
+		case c := <-newConns:
 			s.mu.Lock()
-			s.connections = append(s.connections, c)
+			conn := &clientConn{c: c, buf: new(bytes.Buffer)}
+			s.connections = append(s.connections, conn)
 			if s.inv != (reflect.Value{}) {
-				go s.handleIncomingMessages(c)
+				go s.handleIncomingMessages(conn)
 			}
 			s.mu.Unlock()
 		}
 	}
 }
 
-func (s *Server) handleIncomingMessages(c connection) {
-	et := s.inv.Type().Elem()
+func (s *Server) handleIncomingMessages(conn *clientConn) {
+	var (
+		buf bytes.Buffer
+		dec = gob.NewDecoder(&buf)
+		et  = s.inv.Type().Elem()
+	)
+
 	for {
-		x := reflect.New(et)
-		if err := c.dec.DecodeValue(x); err != nil {
-			if err == io.EOF {
-				return
+		b, err := readChunk(conn.c)
+		if err != nil {
+			if err != io.EOF {
+				s.logger.Println(err)
 			}
-			fmt.Printf("[server] error decoding value: %s\n", err)
+			break
 		}
+
+		for _, decoder := range s.decoders {
+			b = decoder(b)
+		}
+		if _, err := buf.Write(b); err != nil {
+			s.logger.Panicln(err)
+		}
+
+		x := reflect.New(et)
+		if err := dec.DecodeValue(x); err != nil {
+			if err == io.EOF {
+				break
+			}
+			s.logger.Panicln(err)
+		}
+
+		buf.Reset()
 		s.inv.Send(x.Elem())
 	}
+
+	s.mu.Lock()
+	for i := range s.connections {
+		if s.connections[i] == conn {
+			s.connections = append(s.connections[:i], s.connections[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) currentConn() *clientConn {
+	return s.connections[s.i]
 }
 
 func (s *Server) increment() {
@@ -109,109 +209,242 @@ func (s *Server) increment() {
 
 func (s *Server) handleOutgoingMessages() {
 	s.WaitUntilReady()
+
 	for {
 		x, ok := s.outv.Recv()
 		if !ok {
 			break
 		}
 
-		s.mu.Lock()
 		for {
-			if err := s.connections[s.i].enc.EncodeValue(x); err != nil {
-				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
-				if len(s.connections) == 0 {
-					s.mu.Unlock()
-					s.WaitUntilReady()
-					s.mu.Lock()
-				}
-				s.increment()
-			} else {
-				break
+			s.mu.RLock()
+			if len(s.connections) == 0 {
+				s.mu.RUnlock()
+				s.WaitUntilReady()
+				s.mu.RLock()
 			}
+
+			if s.currentConn().enc == nil {
+				s.currentConn().enc = gob.NewEncoder(s.currentConn().buf)
+			}
+
+			if err := s.currentConn().enc.EncodeValue(x); err != nil {
+				s.logger.Println(err)
+
+				s.mu.RUnlock()
+				s.mu.Lock()
+				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
+				s.increment()
+				s.mu.Unlock()
+				s.mu.RLock()
+				continue
+			}
+
+			b := s.currentConn().buf.Bytes()
+			s.currentConn().buf.Reset()
+
+			for _, encoder := range s.encoders {
+				b = encoder(b)
+			}
+
+			if err := writeChunk(s.currentConn().c, b); err != nil {
+				s.logger.Println(err)
+
+				s.mu.RUnlock()
+				s.mu.Lock()
+				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
+				s.increment()
+				s.mu.Unlock()
+				s.mu.RLock()
+				continue
+			}
+
+			s.mu.RUnlock()
+			s.mu.Lock()
+			s.increment()
+			s.mu.Unlock()
+			break
 		}
-		s.increment()
-		s.mu.Unlock()
 	}
 
 	if err := s.ln.Close(); err != nil {
-		fmt.Printf("[server] error closing listener: %s\n", err)
-	}
-	for _, conn := range s.connections {
-		if err := conn.conn.Close(); err != nil {
-			fmt.Printf("error closing connection: %s\n", err)
-		}
+		s.logger.Printf("error closing listener: %s\n", err)
 	}
 }
 
-// ChanServer registers a pair of channels with an active listener. Gob-encoded
-// messages received on the listener will be passed to in; any values passed to
-// out will be gob-encoded and written to one open connection. The server uses
-// a simple round-robin strategy when deciding which connection to send the message
-// to; no client is favored over any others.
-func ChanServer(ln net.Listener, out, in interface{}) *Server {
-	s := &Server{
+func NewClient(conn net.Conn, out, in interface{}) *Client {
+	return &Client{
+		conn:   conn,
 		outv:   reflect.ValueOf(out),
 		inv:    reflect.ValueOf(in),
-		ln:     ln,
-		closed: make(chan struct{}),
+		logger: log.New(os.Stdout, "[distchan] ", log.Lshortfile),
 		done:   make(chan struct{}),
 	}
+}
 
-	go s.handleIncomingConnections()
-	if out != nil {
-		go s.handleOutgoingMessages()
+// Transformer represents a function that does an arbitrary transformation
+// on a piece of data. It's used for defining custom encoders and decoders
+// for modifying how data is sent across the wire.
+type Transformer func([]byte) []byte
+
+// Client represents a registration between a network connection and a pair
+// of channels. See the documentation for Server for more details.
+type Client struct {
+	conn               net.Conn
+	inv, outv          reflect.Value
+	encoders, decoders []Transformer
+	started            bool
+	logger             *log.Logger
+	done               chan struct{}
+}
+
+// AddEncoder adds a new encoder to the client. Any outbound messages
+// will be passed through all registered encoders before being sent
+// over the wire. See the tests for an example of encoding the data
+// using AES encryption.
+func (c *Client) AddEncoder(f Transformer) *Client {
+	c.encoders = append(c.encoders, f)
+	return c
+}
+
+// AddDecoder adds a new decoder to the client. Any inbound messages
+// will be passed through all registered decoders before being sent
+// to the channel. See the tests for an example of decoding the data
+// using AES encryption.
+func (c *Client) AddDecoder(f Transformer) *Client {
+	c.decoders = append(c.decoders, f)
+	return c
+}
+
+// Start instructs the client to begin serving messages.
+func (c *Client) Start() *Client {
+	if c.inv != (reflect.Value{}) {
+		go c.handleIncomingMessages()
 	}
-	return s
+	if c.outv != (reflect.Value{}) {
+		go c.handleOutgoingMessages()
+	}
+	c.started = true
+	return c
 }
 
-// ChanRead pipes incoming gob-encoded messages from conn to the channel ch.
-func ChanRead(conn net.Conn, ch interface{}) {
-	go func() {
-		var (
-			chv = reflect.ValueOf(ch)
-			et  = chv.Type().Elem()
-			dec = gob.NewDecoder(conn)
-		)
-
-		defer func() {
-			chv.Close()
-
-			// A panic can happen if the underlying channel was closed
-			// and we tried to send on it.
-			if r := recover(); r != nil {
-				fmt.Println("attempted to send on a closed channel")
-			}
-		}()
-
-		for {
-			x := reflect.New(et)
-			if err := dec.DecodeValue(x); err != nil {
-				if err == io.EOF {
-					return
-				}
-			} else {
-				chv.Send(x.Elem())
-			}
-		}
-	}()
+// Done returns a channel that will be closed once all in-flight data has been
+// handled.
+func (c *Client) Done() <-chan struct{} {
+	return c.done
 }
 
-// ChanWrite writes values from the channel ch as gob-encoded messages to conn.
-func ChanWrite(conn net.Conn, ch interface{}) {
-	go func() {
-		var (
-			chv = reflect.ValueOf(ch)
-			enc = gob.NewEncoder(conn)
-		)
+// Logger exposes the client's internal logger so that it can be configured.
+// For example, if you want the logs to go somewhere besides standard output
+// (the default), you can use c.Logger().SetOutput(...).
+func (c *Client) Logger() *log.Logger {
+	return c.logger
+}
 
-		for {
-			x, ok := chv.Recv()
-			if !ok {
-				return
-			}
-			if err := enc.EncodeValue(x); err != nil {
-				fmt.Printf("[client] error encoding value %v: %s\n", x.Interface(), err)
-			}
+func (c *Client) handleIncomingMessages() {
+	var (
+		buf bytes.Buffer
+		// The gob decoder uses a buffer because its underlying reader
+		// can't change without running into an "unknown type id" error.
+		dec = gob.NewDecoder(&buf)
+		et  = c.inv.Type().Elem()
+	)
+
+	defer func() {
+		c.inv.Close()
+
+		// A panic can happen if the underlying channel was closed
+		// and we tried to send on it, or if there was a decryption
+		// failure. We don't want the panic to go all the way to the
+		// top, but we do want to stop processing and log the error.
+		if r := recover(); r != nil {
+			c.logger.Println(r)
 		}
 	}()
+
+	for {
+		b, err := readChunk(c.conn)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			panic(err)
+		}
+
+		for _, decoder := range c.decoders {
+			b = decoder(b)
+		}
+		if _, err := buf.Write(b); err != nil {
+			panic(err)
+		}
+
+		x := reflect.New(et)
+		if err := dec.DecodeValue(x); err != nil {
+			if err == io.EOF {
+				break
+			}
+			panic(err)
+		}
+
+		buf.Reset()
+		c.inv.Send(x.Elem())
+	}
+}
+
+func (c *Client) handleOutgoingMessages() {
+	var (
+		buf bytes.Buffer
+		enc = gob.NewEncoder(&buf)
+	)
+
+	for {
+		x, ok := c.outv.Recv()
+		if !ok {
+			break
+		}
+		if err := enc.EncodeValue(x); err != nil {
+			c.logger.Panicln(err)
+		}
+
+		b := buf.Bytes()
+		buf.Reset()
+
+		for _, encoder := range c.encoders {
+			b = encoder(b)
+		}
+
+		if err := writeChunk(c.conn, b); err != nil {
+			c.logger.Printf("error writing value to connection: %s\n", err)
+		}
+	}
+
+	close(c.done)
+}
+
+func readChunk(r io.Reader) ([]byte, error) {
+	var n int32
+	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return nil, err
+	}
+
+	if n == -1 {
+		return nil, io.EOF
+	}
+
+	b := make([]byte, n)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+func writeChunk(w io.Writer, b []byte) error {
+	if err := binary.Write(w, binary.LittleEndian, int32(len(b))); err != nil {
+		return err
+	}
+	if _, err := w.Write(b); err != nil {
+		return err
+	}
+	return nil
 }
