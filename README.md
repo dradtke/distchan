@@ -2,6 +2,11 @@
 
 Package distchan enables Go channels to be used for distributed computation.
 
+**NOTE**: This library is very young, and as such its API is very much subject
+to change. Until this notice is removed, it should be assumed that the API is in
+an alpha state and subject to breakage. That said, the changes shouldn't be too
+drastic, and feedback is very much encouraged, so please give it a shot!
+
 ## Why?
 
 While Go's concurrency story around single-process data pipelines is
