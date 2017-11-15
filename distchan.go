@@ -4,13 +4,22 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"reflect"
+	"runtime"
 	"sync"
-	"time"
+)
+
+const defaultSignature int32 = 0x7f38b034
+
+var (
+	errNotChannel       = errors.New("distchan: provided value is not a channel")
+	errInvalidSignature = errors.New("distchan: invalid signature")
 )
 
 // NewServer registers a pair of channels with an active listener. Gob-encoded
@@ -22,42 +31,52 @@ import (
 // Note that the returned value's Start() method must be called before any
 // messages will be passed. This gives the user an opportunity to register
 // encoders and decoders before any data passes over the network.
-func NewServer(ln net.Listener, out, in interface{}) *Server {
-	return &Server{
-		ln:     ln,
-		outv:   reflect.ValueOf(out),
-		inv:    reflect.ValueOf(in),
-		closed: make(chan struct{}),
-		done:   make(chan struct{}),
-		logger: log.New(os.Stdout, "[distchan] ", log.Lshortfile),
+func NewServer(ln net.Listener, out, in interface{}) (*Server, error) {
+	if in != nil && reflect.ValueOf(in).Kind() != reflect.Chan {
+		return nil, errNotChannel
 	}
+	if out != nil && reflect.ValueOf(out).Kind() != reflect.Chan {
+		return nil, errNotChannel
+	}
+	s := &Server{
+		ln:        ln,
+		out:       out,
+		in:        in,
+		signature: defaultSignature,
+		logger:    log.New(os.Stdout, "[distchan] ", log.Lshortfile),
+	}
+	go s.handleIncomingConnections()
+	return s, nil
 }
 
 // Server represents a registration between a network listener and a pair
 // of channels, one for input and one for output.
 type Server struct {
-	ln                 net.Listener
-	inv, outv          reflect.Value
-	mu                 sync.RWMutex
-	connections        []*clientConn
-	encoders, decoders []Transformer
-	i                  int
-	closed, done       chan struct{}
-	logger             *log.Logger
-}
-
-type clientConn struct {
-	c   net.Conn
-	buf *bytes.Buffer
-	enc *gob.Encoder
+	ln                    net.Listener
+	in, out               interface{}
+	signature             int32
+	mu                    sync.RWMutex
+	i                     int
+	conns                 []net.Conn
+	encoders, decoders    []Transformer
+	started, shuttingDown bool
+	logger                *log.Logger
 }
 
 // Start instructs the server to begin serving messages.
 func (s *Server) Start() *Server {
-	go s.handleIncomingConnections()
-	if s.outv != (reflect.Value{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.in != nil {
+		for _, conn := range s.conns {
+			go s.handleIncomingMessages(conn)
+		}
+	}
+	if s.out != nil {
 		go s.handleOutgoingMessages()
 	}
+	s.started = true
 	return s
 }
 
@@ -79,17 +98,23 @@ func (s *Server) AddDecoder(f Transformer) *Server {
 	return s
 }
 
-// Ready returns true if there are any clients currently connected.
-func (s *Server) Ready() bool {
+// NumClient returns the number of clients connected to this server.
+func (s *Server) NumClient() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.connections) > 0
+
+	return len(s.conns)
+}
+
+// Ready returns true if there are any clients currently connected.
+func (s *Server) Ready() bool {
+	return s.NumClient() > 0
 }
 
 // WaitUntilReady blocks until the server has at least one client available.
 func (s *Server) WaitUntilReady() {
 	for {
-		time.Sleep(1 * time.Second)
+		runtime.Gosched()
 		if s.Ready() {
 			s.i = 0
 			return
@@ -104,194 +129,225 @@ func (s *Server) Logger() *log.Logger {
 	return s.logger
 }
 
+// SetSignature sets the signature used by the server. The signature
+// is the first value written to the connection on each message sent.
+// When either side receives a new message, the first four bytes must
+// match this signature or else the read is aborted.
+//
+// A sensibly-random value is provided by default, but this method
+// can be used to enforce a custom signature instead.
+func (s *Server) SetSignature(signature int32) {
+	s.signature = signature
+}
+
 func (s *Server) handleIncomingConnections() {
-	newConns := make(chan net.Conn)
-	go func() {
-		for {
-			conn, err := s.ln.Accept()
-			if err != nil {
-				// for now, assume it's a "use of closed network connection" error
-				break
-			}
-			newConns <- conn
-		}
-		close(s.closed)
-	}()
+	defer s.shutdown()
 
 	for {
-		select {
-		case <-s.closed:
-			s.mu.RLock()
-			for _, conn := range s.connections {
-				if err := binary.Write(conn.c, binary.LittleEndian, int32(-1)); err != nil {
-					s.logger.Println(err)
-				}
-			}
-			s.mu.RUnlock()
-
-			for {
-				s.mu.RLock()
-				if len(s.connections) == 0 {
-					s.inv.Close()
-					return
-				}
-				s.mu.RUnlock()
-				time.Sleep(500 * time.Millisecond)
-			}
-
-		case c := <-newConns:
-			s.mu.Lock()
-			conn := &clientConn{c: c, buf: new(bytes.Buffer)}
-			s.connections = append(s.connections, conn)
-			if s.inv != (reflect.Value{}) {
-				go s.handleIncomingMessages(conn)
-			}
-			s.mu.Unlock()
+		conn, err := s.ln.Accept()
+		if err != nil {
+			// for now, assume it's a "use of closed network connection" error
+			s.shuttingDown = true
+			return
+		}
+		s.addConn(conn)
+		if s.started && s.in != nil {
+			go s.handleIncomingMessages(conn)
 		}
 	}
 }
 
-func (s *Server) handleIncomingMessages(conn *clientConn) {
+func (s *Server) handleIncomingMessages(conn net.Conn) {
 	var (
 		buf bytes.Buffer
 		dec = gob.NewDecoder(&buf)
-		et  = s.inv.Type().Elem()
+		et  = reflect.TypeOf(s.in).Elem()
 	)
 
+	defer s.deleteConn(conn)
+
 	for {
-		b, err := readChunk(conn.c)
-		if err != nil {
+		buf.Reset()
+		if err := readChunk(&buf, conn, s.signature); err != nil {
 			if err != io.EOF {
-				s.logger.Println(err)
+				s.logger.Printf("%s (dropping connection)", err)
 			}
-			break
+			return
 		}
 
-		for _, decoder := range s.decoders {
-			b = decoder(b)
-		}
-		if _, err := buf.Write(b); err != nil {
-			s.logger.Panicln(err)
-		}
+		runTransformers(&buf, s.decoders)
 
 		x := reflect.New(et)
 		if err := dec.DecodeValue(x); err != nil {
 			if err == io.EOF {
-				break
+				return
 			}
-			s.logger.Panicln(err)
+			panic(err)
 		}
 
-		buf.Reset()
-		s.inv.Send(x.Elem())
-	}
-
-	s.mu.Lock()
-	for i := range s.connections {
-		if s.connections[i] == conn {
-			s.connections = append(s.connections[:i], s.connections[i+1:]...)
-			break
-		}
-	}
-	s.mu.Unlock()
-}
-
-func (s *Server) currentConn() *clientConn {
-	return s.connections[s.i]
-}
-
-func (s *Server) increment() {
-	s.i += 1
-	if s.i >= len(s.connections) {
-		s.i = 0
+		reflect.ValueOf(s.in).Send(x.Elem())
 	}
 }
 
 func (s *Server) handleOutgoingMessages() {
-	s.WaitUntilReady()
+	var (
+		buf bytes.Buffer
+		// Each connection needs a unique *gob.Encoder in order
+		// to avoid "unknown type id" errors.
+		gobbers = make(map[net.Conn]*gob.Encoder)
+	)
+
+	defer func() {
+		if err := s.ln.Close(); err != nil {
+			s.logger.Printf("error closing listener: %s\n", err)
+		}
+	}()
 
 	for {
-		x, ok := s.outv.Recv()
+		x, ok := reflect.ValueOf(s.out).Recv()
 		if !ok {
-			break
+			return
 		}
 
 		for {
-			s.mu.RLock()
-			if len(s.connections) == 0 {
-				s.mu.RUnlock()
+			conn := s.currentConn()
+			if conn == nil {
 				s.WaitUntilReady()
-				s.mu.RLock()
-			}
-
-			if s.currentConn().enc == nil {
-				s.currentConn().enc = gob.NewEncoder(s.currentConn().buf)
-			}
-
-			if err := s.currentConn().enc.EncodeValue(x); err != nil {
-				s.logger.Println(err)
-
-				s.mu.RUnlock()
-				s.mu.Lock()
-				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
-				s.increment()
-				s.mu.Unlock()
-				s.mu.RLock()
 				continue
 			}
 
-			b := s.currentConn().buf.Bytes()
-			s.currentConn().buf.Reset()
-
-			for _, encoder := range s.encoders {
-				b = encoder(b)
+			if gobbers[conn] == nil {
+				gobbers[conn] = gob.NewEncoder(&buf)
 			}
 
-			if err := writeChunk(s.currentConn().c, b); err != nil {
-				s.logger.Println(err)
-
-				s.mu.RUnlock()
-				s.mu.Lock()
-				s.connections = append(s.connections[:s.i], s.connections[s.i+1:]...)
-				s.increment()
-				s.mu.Unlock()
-				s.mu.RLock()
+			buf.Reset()
+			if err := gobbers[conn].EncodeValue(x); err != nil {
+				s.logger.Printf("%s (dropping connection and trying again)", err)
+				s.deleteConn(conn)
 				continue
 			}
 
-			s.mu.RUnlock()
-			s.mu.Lock()
-			s.increment()
-			s.mu.Unlock()
+			runTransformers(&buf, s.encoders)
+
+			if err := writeChunk(conn, &buf, s.signature); err != nil {
+				s.logger.Printf("%s (dropping connection and trying again)", err)
+				s.deleteConn(conn)
+				continue
+			}
+
+			break
+		}
+
+		s.nextConn()
+	}
+}
+
+func (s *Server) addConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.conns = append(s.conns, conn)
+}
+
+func (s *Server) currentConn() net.Conn {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.conns) == 0 {
+		return nil
+	}
+	if s.i >= len(s.conns) {
+		s.i = 0
+	}
+	return s.conns[s.i]
+}
+
+func (s *Server) deleteConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.conns {
+		if s.conns[i] == conn {
+			s.conns = append(s.conns[:i], s.conns[i+1:]...)
 			break
 		}
 	}
 
-	if err := s.ln.Close(); err != nil {
-		s.logger.Printf("error closing listener: %s\n", err)
+	if s.shuttingDown && len(s.conns) == 0 {
+		reflect.ValueOf(s.in).Close()
 	}
 }
 
-func NewClient(conn net.Conn, out, in interface{}) *Client {
-	return &Client{
-		conn:   conn,
-		outv:   reflect.ValueOf(out),
-		inv:    reflect.ValueOf(in),
-		logger: log.New(os.Stdout, "[distchan] ", log.Lshortfile),
-		done:   make(chan struct{}),
+func (s *Server) nextConn() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.i++
+	if s.i >= len(s.conns) {
+		s.i = 0
 	}
+}
+
+func (s *Server) shutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, conn := range s.conns {
+		if err := binary.Write(conn, binary.LittleEndian, s.signature); err != nil {
+			s.logger.Println(err)
+		}
+		if err := binary.Write(conn, binary.LittleEndian, int32(-1)); err != nil {
+			s.logger.Println(err)
+		}
+	}
+}
+
+func NewClient(conn net.Conn, out, in interface{}) (*Client, error) {
+	if in != nil && reflect.ValueOf(in).Kind() != reflect.Chan {
+		return nil, errNotChannel
+	}
+	if out != nil && reflect.ValueOf(out).Kind() != reflect.Chan {
+		return nil, errNotChannel
+	}
+	return &Client{
+		conn:      conn,
+		out:       out,
+		in:        in,
+		signature: defaultSignature,
+		logger:    log.New(os.Stdout, "[distchan] ", log.Lshortfile),
+		done:      make(chan struct{}),
+	}, nil
 }
 
 // Transformer represents a function that does an arbitrary transformation
 // on a piece of data. It's used for defining custom encoders and decoders
 // for modifying how data is sent across the wire.
-type Transformer func([]byte) []byte
+type Transformer func(src io.Reader) io.Reader
+
+func runTransformers(buf *bytes.Buffer, transformers []Transformer) {
+	if len(transformers) == 0 {
+		return
+	}
+	var r io.Reader = buf
+	for _, f := range transformers {
+		r = f(r)
+	}
+	b, err := ioutil.ReadAll(r)
+	if err != nil {
+		panic(err)
+	}
+	buf.Reset()
+	if _, err := buf.Write(b); err != nil {
+		panic(err)
+	}
+}
 
 // Client represents a registration between a network connection and a pair
 // of channels. See the documentation for Server for more details.
 type Client struct {
 	conn               net.Conn
-	inv, outv          reflect.Value
+	in, out            interface{}
+	signature          int32
 	encoders, decoders []Transformer
 	started            bool
 	logger             *log.Logger
@@ -318,10 +374,10 @@ func (c *Client) AddDecoder(f Transformer) *Client {
 
 // Start instructs the client to begin serving messages.
 func (c *Client) Start() *Client {
-	if c.inv != (reflect.Value{}) {
+	if c.in != nil {
 		go c.handleIncomingMessages()
 	}
-	if c.outv != (reflect.Value{}) {
+	if c.out != nil {
 		go c.handleOutgoingMessages()
 	}
 	c.started = true
@@ -341,17 +397,28 @@ func (c *Client) Logger() *log.Logger {
 	return c.logger
 }
 
+// SetSignature sets the signature used by the client. The signature
+// is the first value written to the connection on each message sent.
+// When either side receives a new message, the first four bytes must
+// match this signature or else the read is aborted.
+//
+// A sensibly-random value is provided by default, but this method
+// can be used to enforce a custom signature instead.
+func (c *Client) SetSignature(signature int32) {
+	c.signature = signature
+}
+
 func (c *Client) handleIncomingMessages() {
 	var (
 		buf bytes.Buffer
 		// The gob decoder uses a buffer because its underlying reader
 		// can't change without running into an "unknown type id" error.
 		dec = gob.NewDecoder(&buf)
-		et  = c.inv.Type().Elem()
+		et  = reflect.TypeOf(c.in).Elem()
 	)
 
 	defer func() {
-		c.inv.Close()
+		reflect.ValueOf(c.in).Close()
 
 		// A panic can happen if the underlying channel was closed
 		// and we tried to send on it, or if there was a decryption
@@ -363,31 +430,25 @@ func (c *Client) handleIncomingMessages() {
 	}()
 
 	for {
-		b, err := readChunk(c.conn)
-		if err != nil {
+		buf.Reset()
+		if err := readChunk(&buf, c.conn, c.signature); err != nil {
 			if err == io.EOF {
-				break
+				return
 			}
 			panic(err)
 		}
 
-		for _, decoder := range c.decoders {
-			b = decoder(b)
-		}
-		if _, err := buf.Write(b); err != nil {
-			panic(err)
-		}
+		runTransformers(&buf, c.decoders)
 
 		x := reflect.New(et)
 		if err := dec.DecodeValue(x); err != nil {
 			if err == io.EOF {
-				break
+				return
 			}
 			panic(err)
 		}
 
-		buf.Reset()
-		c.inv.Send(x.Elem())
+		reflect.ValueOf(c.in).Send(x.Elem())
 	}
 }
 
@@ -398,7 +459,9 @@ func (c *Client) handleOutgoingMessages() {
 	)
 
 	for {
-		x, ok := c.outv.Recv()
+		buf.Reset()
+
+		x, ok := reflect.ValueOf(c.out).Recv()
 		if !ok {
 			break
 		}
@@ -406,14 +469,9 @@ func (c *Client) handleOutgoingMessages() {
 			c.logger.Panicln(err)
 		}
 
-		b := buf.Bytes()
-		buf.Reset()
+		runTransformers(&buf, c.encoders)
 
-		for _, encoder := range c.encoders {
-			b = encoder(b)
-		}
-
-		if err := writeChunk(c.conn, b); err != nil {
+		if err := writeChunk(c.conn, &buf, c.signature); err != nil {
 			c.logger.Printf("error writing value to connection: %s\n", err)
 		}
 	}
@@ -421,30 +479,35 @@ func (c *Client) handleOutgoingMessages() {
 	close(c.done)
 }
 
-func readChunk(r io.Reader) ([]byte, error) {
+func readChunk(buf io.Writer, r io.Reader, signature int32) error {
 	var n int32
 	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
-		return nil, err
+		return err
+	}
+
+	if n != signature {
+		return errInvalidSignature
+	}
+
+	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return err
 	}
 
 	if n == -1 {
-		return nil, io.EOF
+		return io.EOF
 	}
 
-	b := make([]byte, n)
-	if _, err := io.ReadFull(r, b); err != nil {
-		return nil, err
-	}
-
-	return b, nil
+	_, err := io.CopyN(buf, r, int64(n))
+	return err
 }
 
-func writeChunk(w io.Writer, b []byte) error {
-	if err := binary.Write(w, binary.LittleEndian, int32(len(b))); err != nil {
+func writeChunk(w io.Writer, buf *bytes.Buffer, signature int32) error {
+	if err := binary.Write(w, binary.LittleEndian, signature); err != nil {
 		return err
 	}
-	if _, err := w.Write(b); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(buf.Len())); err != nil {
 		return err
 	}
-	return nil
+	_, err := buf.WriteTo(w)
+	return err
 }

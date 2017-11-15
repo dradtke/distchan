@@ -14,9 +14,9 @@ func main() {
 	}
 
 	var (
-		out    = make(chan string)
-		in     = make(chan string)
-		server = distchan.NewServer(ln, out, in)
+		out       = make(chan string)
+		in        = make(chan string)
+		server, _ = distchan.NewServer(ln, out, in)
 	)
 
 	server.Start()

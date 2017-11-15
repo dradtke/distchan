@@ -40,7 +40,8 @@ func main() {
 		panic(err)
 	}
 
-	distchan.NewClient(conn, out, in).Start()
+	client, _ := distchan.NewClient(conn, out, in)
+	client.Start()
 
 	fmt.Println("waiting for input...")
 	for input := range in {
