@@ -31,6 +31,8 @@ computationally expensive, and you want to distribute that work across a number
 of nodes. First, you'll need to create a server in charge of defining the work
 to be done:
 
+### Server
+
 ```go
 package main
 
@@ -48,9 +50,9 @@ func main() {
 	}
 
 	var (
-		out    = make(chan string)
-		in     = make(chan string)
-		server = distchan.NewServer(ln, out, in)
+		out       = make(chan string)
+		in        = make(chan string)
+		server, _ = distchan.NewServer(ln, out, in)
 	)
 
 	server.Start()
@@ -75,6 +77,8 @@ func producer(out chan<- string) {
 Then you'll need to create a client, or worker. It's similarly easy to get wired
 up, so you can focus on the hard part: capitalizing strings:
 
+### Client
+
 ```go
 package main
 
@@ -97,7 +101,8 @@ func main() {
 		in  = make(chan string)
 	)
 
-	client := distchan.NewClient(conn, out, in).Start()
+	client, _ := distchan.NewClient(conn, out, in)
+	client.Start()
 
 	// Loop over all input from the server...
 	for input := range in {
