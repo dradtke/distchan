@@ -7,6 +7,9 @@ to change. Until this notice is removed, it should be assumed that the API is in
 an alpha state and subject to breakage. That said, the changes shouldn't be too
 drastic, and feedback is very much encouraged, so please give it a shot!
 
+Also, check it out on
+[Chisel](https://chiselapp.com/user/dradtke/repository/distchan/home)!
+
 ## Why?
 
 While Go's concurrency story around single-process data pipelines is
