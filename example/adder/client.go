@@ -30,17 +30,18 @@ func main() {
 
 	gob.Register(AdderInput{})
 	gob.Register(AdderOutput{})
-	var (
-		out = make(chan AdderOutput)
-		in  = make(chan AdderInput)
-	)
 
 	conn, err := net.Dial("tcp", *addr)
 	if err != nil {
 		panic(err)
 	}
 
-	client, _ := distchan.NewClient(conn, out, in)
+	var (
+		out       = make(chan AdderOutput)
+		in        = make(chan AdderInput)
+		client, _ = distchan.NewClient(conn, out, in)
+	)
+
 	client.Start()
 
 	fmt.Println("waiting for input...")

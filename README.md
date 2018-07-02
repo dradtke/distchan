@@ -100,11 +100,11 @@ func main() {
 	}
 
 	var (
-		out = make(chan string)
-		in  = make(chan string)
+		out       = make(chan string)
+		in        = make(chan string)
+		client, _ = distchan.NewClient(conn, out, in)
 	)
 
-	client, _ := distchan.NewClient(conn, out, in)
 	client.Start()
 
 	// Loop over all input from the server...

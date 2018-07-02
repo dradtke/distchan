@@ -56,20 +56,21 @@ func main() {
 		log.Fatal("no bind address specified")
 	}
 
-	rand.Seed(time.Now().Unix())
-	gob.Register(AdderInput{})
-	gob.Register(AdderOutput{})
-	var (
-		out = make(chan AdderInput)
-		in  = make(chan AdderOutput)
-	)
-
 	ln, err := net.Listen("tcp", *bindAddr)
 	if err != nil {
 		panic(err)
 	}
 
-	server, _ := distchan.NewServer(ln, out, in)
+	rand.Seed(time.Now().Unix())
+	gob.Register(AdderInput{})
+	gob.Register(AdderOutput{})
+
+	var (
+		out       = make(chan AdderInput)
+		in        = make(chan AdderOutput)
+		server, _ = distchan.NewServer(ln, out, in)
+	)
+
 	server.Start()
 
 	fmt.Println("waiting for clients to connect...")
